@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  ollama:
+    image: ollama/ollama
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - /home/codemusic/ollama-models:/root/.ollama
+    restart: unless-stopped
+
+  openwebui:
+    image: ghcr.io/open-webui/open-webui
+    container_name: openwebui
+    ports:
+      - "3000:8080"
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+    depends_on:
+      - ollama
+    restart: unless-stopped
+
+  homeassistant:
+    image: homeassistant/home-assistant:stable
+    container_name: homeassistant
+    network_mode: host
+    privileged: true
+#    ports:
+#      - "8123:8123"
+    volumes:
+      - /home/codemusic/homeassistant-config:/config
+      - /run/dbus:/run/dbus:ro
+      - /var/run/dbus:/var/run/dbus:ro
+    restart: unless-stopped

@@ -1,0 +1,5 @@
+{
+  "ServerApp": {
+    "password": "argon2:$argon2id$v=19$m=10240,t=10,p=8$ZU93CVLinzwaGjWPFA5D7Q$Ie3s/BZK40i/pngpO70DXYNP5GX2W5M2Z5e8pIxyYxQ"
+  }
+}

@@ -1,0 +1,90 @@
+#!/bin/bash
+
+MODEL_DIR="$HOME/llama.cpp/models"
+DEFAULT_MODEL_SUBPATH="deepseek/deepseek-coder-1.3b-instruct.Q4_K_M.gguf"
+DEFAULT_SYSTEM_MSG="You are a helpful assistant."
+DEFAULT_PROMPT="Hello!"
+DEFAULT_NPREDICT=200
+DEFAULT_STREAM="yes"
+DEFAULT_TTS="yes"
+TTS_DEVICE="plughw:2,0"
+TTS_VOICE="en"
+
+# Collect models
+mapfile -t MODELS < <(find "$MODEL_DIR" -name "*.gguf" | sort)
+get_model_name() { basename "${MODELS[$1]}"; }
+
+# Defaults
+MODEL_PATH="$MODEL_DIR/$DEFAULT_MODEL_SUBPATH"
+SYSTEM_MSG="$DEFAULT_SYSTEM_MSG"
+PROMPT="$DEFAULT_PROMPT"
+NPREDICT=$DEFAULT_NPREDICT
+STREAM=$DEFAULT_STREAM
+TTS_ENABLED=$DEFAULT_TTS
+
+if [[ "$1" == "--wizard" ]]; then
+  echo "🧙 Welcome to RoverNet Wizard Mode"
+
+  echo "📦 Available models:"
+  for i in "${!MODELS[@]}"; do
+    echo "  [$i] $(get_model_name $i)"
+  done
+
+  read -p "🧠 Choose a model by number [0]: " model_index
+  model_index=${model_index:-0}
+  MODEL_PATH="${MODELS[$model_index]}"
+
+  echo "🧾 Default system message: \"$DEFAULT_SYSTEM_MSG\""
+  read -p "💬 Enter system message [Enter for default]: " SYSTEM_MSG
+  SYSTEM_MSG=${SYSTEM_MSG:-$DEFAULT_SYSTEM_MSG}
+
+  echo "🔍 Default prompt: \"$DEFAULT_PROMPT\""
+  read -p "📝 Enter your prompt [Enter for default]: " PROMPT
+  PROMPT=${PROMPT:-$DEFAULT_PROMPT}
+
+  read -p "🔢 Max tokens to predict [$DEFAULT_NPREDICT]: " NPREDICT
+  NPREDICT=${NPREDICT:-$DEFAULT_NPREDICT}
+
+  read -p "🌊 Stream output as it generates? (yes/no) [$DEFAULT_STREAM]: " STREAM
+  STREAM=${STREAM:-$DEFAULT_STREAM}
+
+  read -p "🗣️ Enable Text-to-Speech (TTS)? (yes/no) [$DEFAULT_TTS]: " TTS_ENABLED
+  TTS_ENABLED=${TTS_ENABLED:-$DEFAULT_TTS}
+
+  if [[ "$TTS_ENABLED" == "yes" ]]; then
+    echo "🎤 Available English voices:"
+    mapfile -t VOICES < <(espeak-ng --voices | grep en | awk '{print $4}')
+    for i in "${!VOICES[@]}"; do
+      echo "  [$i] ${VOICES[$i]}"
+    done
+
+    read -p "🎙️ Choose a voice [default=en]: " voice_index
+    TTS_VOICE="${VOICES[$voice_index]}"
+    if [[ -z "$TTS_VOICE" ]]; then
+      TTS_VOICE="en"
+    fi
+  fi
+fi
+
+# Print setup
+echo -e "\n🚀 Launching RoverNet with:"
+echo "🟪 Model:  $(basename \"$MODEL_PATH\")"
+echo "🎭 Persona: $SYSTEM_MSG"
+echo "📏 Limit:  --n-predict=$NPREDICT"
+echo "📡 Stream: $STREAM | 🔊 TTS: $TTS_ENABLED | 🗣️ Voice: $TTS_VOICE"
+
+# Run the model and stream with TTS
+"$HOME/llama.cpp/build/bin/llama-cli" \
+  -m "$MODEL_PATH" \
+  --n-predict "$NPREDICT" \
+  --color -t 6 \
+  --prompt "$PROMPT" \
+  $( [[ "$STREAM" == "yes" ]] && echo "--stream" ) |
+awk -v tts_enabled="$TTS_ENABLED" -v dev="$TTS_DEVICE" -v voice="$TTS_VOICE" '
+{
+  printf "%s", $0; fflush();
+  if (tts_enabled == "yes" && length($0) > 0) {
+    cmd = "echo \"" $0 "\" | espeak-ng -v " voice " --stdout | aplay -D " dev " &"
+    system(cmd)
+  }
+}'

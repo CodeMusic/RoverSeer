@@ -1,0 +1,45 @@
+
+# Loads default set of integrations. Do not remove.
+default_config:
+
+# Load frontend themes from the themes folder
+frontend:
+  themes: !include_dir_merge_named themes
+
+automation: !include automations.yaml
+script: !include scripts.yaml
+scene: !include scenes.yaml
+
+tts:
+  - platform: wyoming
+tts:
+  - platform: wyoming
+    host: 127.0.0.1  # Or "host.docker.internal" if HA runs in another container
+    port: 10200
+    engine: piper
+    voice: en_US-amy-medium
+    url: "http://localhost:10200"
+
+input_select:
+  piper_voice:
+    name: Piper Voice
+    options:
+      - en_US-amy
+      - en_US-lessac
+      - en_US-ryan
+      - en_US-arctic
+    initial: en_US-lessac
+
+shell_command:
+  set_piper_voice: "/home/codemusic/set_piper_voice.sh {{ voice }}"
+
+automation:
+  - alias: Update Piper Voice
+    trigger:
+      - platform: state
+        entity_id: input_select.piper_voice
+    action:
+      - service: shell_command.set_piper_voice
+        data:
+          voice: "{{ states('input_select.piper_voice') }}"
+

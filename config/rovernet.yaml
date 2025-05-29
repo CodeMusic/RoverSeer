@@ -1,0 +1,95 @@
+# RoverNet Configuration
+
+# Environment Variables
+environment:
+  OLLAMA_HOST: "http://localhost:11434"
+  MODELS_DIR: "/home/codemusic/.ollama/models"
+  OPENAI_API_KEY: ${OPENAI_API_KEY}
+  HF_TOKEN: ""        # Set via environment variable
+  ROVERNET_SYSTEM_MSG: "You are RoverNet, an AI assistant running on a Raspberry Pi. You are helpful, friendly, and concise. You use text-to-speech to communicate."
+  DEFAULT_MODEL: "nollama/mythomax-l2-13b:Q4_K_M"
+  DEFAULT_VOICE: "en-us"
+  N_PREDICT: 512
+  TEMP: 0.7
+  THREADS: 4
+  LOAD_TIMEOUT_SECONDS: 300
+  TIMEOUT_SECONDS: 60
+  CHECK_INTERVAL: 1
+  MAX_MEMORY_PERCENT: 90
+  STREAM_CHUNK_SIZE: 50  # Number of characters to accumulate before TTS
+  TTS_ENGINE: "pyttsx3"  # Text-to-speech engine to use
+
+# Audio Settings
+audio:
+  voice_device: "plughw:2,0"  # AB13X USB Audio device
+  volume_level: 91
+  mic_level: 91
+  voice: "mb-en1"
+  voice_params:
+    pitch: 50
+    speed: 150
+    word_gap: 1
+  streaming:
+    chunk_size: 50  # Characters per chunk
+    min_chunk_size: 20  # Minimum characters before speaking
+    max_chunk_size: 100  # Maximum characters per chunk
+    sentence_break: true  # Break on sentence boundaries
+  available_voices:
+    - mb-en1  # MBROLA British English male
+    - en-us   # American English
+    - en-uk   # British English
+    - en-au   # Australian English
+
+# Resource Management
+resources:
+  max_memory_percent: 90
+  timeout_seconds: 60
+  load_timeout_seconds: 300
+  check_interval: 1
+
+# AI Mode Configurations
+ai_modes:
+  local:
+    default_model: "nollama/mythomax-l2-13b:Q4_K_M"
+    n_predict: 512
+    threads: 4
+    temp: 0.7
+    stream: true  # Enable streaming
+    system_message: "You are a helpful, concise AI. Respond with a <think> block (max 3 lines), then a clear answer."
+
+  openai:
+    model: "gpt-4-turbo-preview"
+    system_message: "You are a helpful, concise AI assistant. Provide clear and direct responses."
+    max_tokens: 1000
+
+  penphin:
+    dolphin:
+      model: "tinyllama"
+      n_predict: 200
+      threads: 4
+      system_message: "You are Dolphin, the logical and analytical AI agent. Focus on facts, data, and rational analysis."
+
+    penguin:
+      model: "tinyllama"
+      n_predict: 200
+      threads: 4
+      system_message: "You are Penguin, the creative and intuitive AI agent. Focus on metaphors, patterns, and innovative thinking."
+
+    synth:
+      model: "gpt-4-turbo-preview"
+      system_message: "You are Penphin, an AI who balances logic and creativity by combining the thoughts of two AI advisors."
+      max_tokens: 1000
+
+# Terminal settings
+terminal:
+  colors:
+    purple: '\033[1;35m'
+    blue: '\033[1;34m'
+    cyan: '\033[1;36m'
+    red: '\033[1;31m'
+    yellow: '\033[1;33m'
+    green: '\033[1;32m'
+    reset: '\033[0m'
+  progress:
+    spin_chars: '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    spin_interval: 0.1 

@@ -1,13 +1,48 @@
 #!/bin/bash
 
-LLAMA_BIN="$HOME/llama.cpp/build/bin/llama-cli"
-MODELS_DIR="$HOME/llama.cpp/models"
-DEFAULT_MODEL="$MODELS_DIR/deepseek/deepseek-coder-1.3b-instruct.Q4_K_M.gguf"
-DEFAULT_VOICE="en-us"
-VOICE_DEVICE="plughw:2,0"  # Using the confirmed working audio device
-N_PREDICT=200
-THREADS=4
-TEMP=0.8
+# Load configuration
+CONFIG_FILE="$HOME/bin/rovernet_src/config/rovernet.yaml"
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "Error: Configuration file not found at $CONFIG_FILE"
+    exit 1
+fi
+
+# Check if Ollama is running
+if ! curl -s "$OLLAMA_HOST" > /dev/null; then
+    echo "Error: Ollama is not running. Please start it with:"
+    echo "sudo systemctl start ollama"
+    exit 1
+fi
+
+# Source configuration
+source <(python3 -c "
+import yaml
+import sys
+with open('$CONFIG_FILE', 'r') as f:
+    config = yaml.safe_load(f)
+    # Export environment variables
+    for key, value in config['environment'].items():
+        print(f'export {key}={value}')
+    # Export resource management settings
+    for key, value in config['resources'].items():
+        print(f'export {key.upper()}={value}')
+    # Export audio settings
+    for key, value in config['audio'].items():
+        if isinstance(value, dict):
+            for subkey, subvalue in value.items():
+                print(f'export {key.upper()}_{subkey.upper()}={subvalue}')
+        else:
+            print(f'export {key.upper()}={value}')
+    # Export local AI settings
+    for key, value in config['ai_modes']['local'].items():
+        print(f'export {key.upper()}={value}')
+    # Export terminal colors
+    for key, value in config['terminal']['colors'].items():
+        print(f'export {key.upper()}=\"$value\"')
+    # Export progress settings
+    for key, value in config['terminal']['progress'].items():
+        print(f'export PROGRESS_{key.upper()}=\"$value\"')
+")
 
 # Default system message
 ROVERNET_SYSTEM_MSG=${ROVERNET_SYSTEM_MSG:-"You are a helpful, concise AI. Respond with a <think> block (max 3 lines), then a clear answer."}
@@ -17,119 +52,582 @@ PURPLE='\033[1;35m'
 BLUE='\033[1;34m'
 CYAN='\033[1;36m'
 RED='\033[1;31m'
+YELLOW='\033[1;33m'
+GREEN='\033[1;32m'
 RESET='\033[0m'
+
+# Progress indicator
+show_progress() 
+{
+    local pid=$1
+    local message=$2
+    local i=0
+    local spin="$PROGRESS_SPIN_CHARS"
+    
+    while kill -0 $pid 2>/dev/null; do
+        i=$(( (i+1) % 10 ))
+        printf "\r${CYAN}%s ${spin:$i:1}${RESET}" "$message"
+        sleep $PROGRESS_SPIN_INTERVAL
+    done
+    printf "\r"
+}
+
+# Set audio levels
+set_audio_levels() 
+{
+    echo -e "${CYAN}Setting audio levels...${RESET}"
+    
+    # Get audio settings from config
+    AUDIO_SETTINGS=$(python3 -c "
+import yaml
+with open('$CONFIG_FILE', 'r') as f:
+    config = yaml.safe_load(f)
+    print(f\"{config['audio']['voice_device']} {config['audio']['volume_level']} {config['audio']['mic_level']}\")
+")
+    
+    # Parse settings
+    VOICE_DEVICE=$(echo "$AUDIO_SETTINGS" | cut -d' ' -f1)
+    VOLUME_LEVEL=$(echo "$AUDIO_SETTINGS" | cut -d' ' -f2)
+    MIC_LEVEL=$(echo "$AUDIO_SETTINGS" | cut -d' ' -f3)
+    
+    # Set volume level
+    echo -e "${CYAN}Setting volume to ${VOLUME_LEVEL}%...${RESET}"
+    echo -e "${YELLOW}Debug: Using device $VOICE_DEVICE${RESET}"
+    
+    # Set PCM volume for USB headset (card 2)
+    if amixer -c 2 sset 'PCM' "${VOLUME_LEVEL}%" >/dev/null 2>&1; then
+        echo -e "${GREEN}PCM volume set to ${VOLUME_LEVEL}%${RESET}"
+    else
+        echo -e "${RED}Warning: Could not set PCM volume${RESET}"
+        echo -e "${YELLOW}Debug: Available controls:${RESET}"
+        amixer -c 2 controls
+    fi
+    
+    # Set microphone level for USB headset (card 2)
+    echo -e "${CYAN}Setting microphone level to ${MIC_LEVEL}%...${RESET}"
+    # First enable the mic
+    if amixer -c 2 sset 'Mic Capture Switch' on >/dev/null 2>&1; then
+        echo -e "${GREEN}Microphone enabled${RESET}"
+        # Then set the volume
+        if amixer -c 2 sset 'Mic Capture Volume' "${MIC_LEVEL}%" >/dev/null 2>&1; then
+            echo -e "${GREEN}Microphone level set to ${MIC_LEVEL}%${RESET}"
+        else
+            echo -e "${YELLOW}Warning: Could not set microphone level${RESET}"
+        fi
+    else
+        echo -e "${YELLOW}Warning: Could not enable microphone${RESET}"
+        echo -e "${YELLOW}Debug: Available capture controls:${RESET}"
+        amixer -c 2 controls | grep -i capture
+    fi
+    
+    # Test audio output with error handling
+    echo -e "${CYAN}Testing audio output...${RESET}"
+    # First try with espeak
+    if ! echo "RoverNet is online." | espeak-ng --stdout | aplay -D "$VOICE_DEVICE" 2>/dev/null; then
+        # If that fails, try with a test file
+        if ! aplay -D "$VOICE_DEVICE" /usr/share/sounds/alsa/Front_Center.wav 2>/dev/null; then
+            echo -e "${RED}Warning: Audio test failed. Continuing without audio.${RESET}"
+            echo -e "${YELLOW}Debug info:${RESET}"
+            echo -e "Device: $VOICE_DEVICE"
+            aplay -l
+            return 1
+        fi
+    fi
+    echo -e "${GREEN}Audio test successful${RESET}"
+}
+
+# Call set_audio_levels at startup
+set_audio_levels
+
+# Conversation context for all modes
+CONVERSATION_HISTORY=""
+
+# Resource monitoring functions
+check_system_resources() 
+{
+    local memory_usage=$(free | grep Mem | awk '{print $3/$2 * 100.0}')
+    if (( $(echo "$memory_usage > $MAX_MEMORY_PERCENT" | bc -l) )); then
+        echo -e "${YELLOW}Warning: High memory usage detected ($(printf "%.1f" $memory_usage)%)${RESET}"
+        return 1
+    fi
+    return 0
+}
+
+monitor_process() 
+{
+    local pid=$1
+    local start_time=$(date +%s)
+    local is_loading=$2
+    
+    while kill -0 $pid 2>/dev/null; do
+        local current_time=$(date +%s)
+        local elapsed=$((current_time - start_time))
+        local timeout=$([ "$is_loading" = true ] && echo "$LOAD_TIMEOUT_SECONDS" || echo "$TIMEOUT_SECONDS")
+        
+        if [ $elapsed -gt $timeout ]; then
+            echo -e "\n${RED}Error: Process timeout after ${timeout} seconds${RESET}"
+            kill -9 $pid 2>/dev/null
+            return 1
+        fi
+        
+        if ! check_system_resources; then
+            echo -e "\n${RED}Error: System resources critical, terminating process${RESET}"
+            kill -9 $pid 2>/dev/null
+            return 1
+        fi
+        
+        sleep $CHECK_INTERVAL
+    done
+    return 0
+}
+
+cleanup() 
+{
+    local pid=$1
+    local pipe=$2
+    
+    # Kill the process if it's still running
+    kill -9 $pid 2>/dev/null
+    
+    # Clean up the pipe
+    rm -f "$pipe"
+    
+    # Reset terminal
+    stty sane
+}
 
 show_help() {
   echo -e "${BLUE}Usage:${RESET} rovernet [--model=FILE] [--prompt='TEXT'] [--system='SYSMSG'] [--voice=en-us|en-uk|en-au] [--wizard]"
 }
 
+format_system_message() {
+  local msg="$1"
+  # Remove any existing system message markers
+  msg=$(echo "$msg" | sed -E 's/<<SYS>>|<\/SYS>>|\[INST\]|\[\/INST\]//g')
+  # Format according to the model's expected format
+  echo "<<SYS>>$msg<</SYS>>"
+}
+
+# Function to speak text using either MBROLA or espeak-ng
 speak_text() {
-  local text="$1"
-  if [[ -n "$VOICE" ]]; then
-    echo "$text" | espeak-ng -v "$VOICE" --stdout | aplay -D "$VOICE_DEVICE" 2>/dev/null || {
-      echo -e "${RED}Warning: Audio playback failed. Continuing without audio.${RESET}"
-    }
-  fi
-}
-
-run_model() {
-  echo -e "${PURPLE}🟪 Model Active:${RESET} $MODEL"
-  echo -e "${CYAN}🎭 Persona:${RESET} $SYS_MSG"
-  echo -e "${CYAN}📏 Limit:${RESET}  --n-predict=$N_PREDICT"
-  [[ -n "$VOICE" ]] && echo -e "${CYAN}🔊 Voice:${RESET} $VOICE (Device: $VOICE_DEVICE)"
-  echo ""
-
-  # Create a named pipe for streaming
-  PIPE=$(mktemp -u)
-  mkfifo "$PIPE"
-
-  # Start the model in the background
-  "$LLAMA_BIN" \
-    -m "$MODEL" \
-    -p "[INST] <<SYS>>$SYS_MSG<</SYS>> $PROMPT [/INST]" \
-    --n-predict "$N_PREDICT" \
-    --color \
-    --temp "$TEMP" \
-    --threads "$THREADS" > "$PIPE" &
-
-  # Process the stream
-  while IFS= read -r line; do
-    echo "$line"
-    if [[ -n "$VOICE" ]]; then
-      speak_text "$line"
+    local text="$1"
+    if [[ -n "$text" && ! "$text" =~ ^[[:space:]]*$ ]]; then
+        echo -e "${CYAN}Speaking:${RESET} $text"
+        if [[ "$VOICE" == mb-* ]]; then
+            # Use MBROLA
+            echo "$text" | espeak-ng -v "$VOICE" \
+                -p "$AUDIO_VOICE_PARAMS_PITCH" \
+                -s "$AUDIO_VOICE_PARAMS_SPEED" \
+                -g "$AUDIO_VOICE_PARAMS_WORD_GAP" \
+                --stdout | aplay -D "$VOICE_DEVICE" 2>/dev/null || {
+                echo -e "${RED}Warning: MBROLA playback failed, falling back to espeak-ng${RESET}"
+                echo "$text" | espeak-ng -v "en-us" \
+                    -p "$AUDIO_VOICE_PARAMS_PITCH" \
+                    -s "$AUDIO_VOICE_PARAMS_SPEED" \
+                    -g "$AUDIO_VOICE_PARAMS_WORD_GAP" \
+                    --stdout | aplay -D "$VOICE_DEVICE" 2>/dev/null
+            }
+        else
+            # Use espeak-ng
+            echo "$text" | espeak-ng -v "$VOICE" \
+                -p "$AUDIO_VOICE_PARAMS_PITCH" \
+                -s "$AUDIO_VOICE_PARAMS_SPEED" \
+                -g "$AUDIO_VOICE_PARAMS_WORD_GAP" \
+                --stdout | aplay -D "$VOICE_DEVICE" 2>/dev/null || {
+                echo -e "${RED}Warning: Audio playback failed. Continuing without audio.${RESET}"
+            }
+        fi
     fi
-  done < "$PIPE"
-
-  # Clean up
-  rm "$PIPE"
 }
 
-# Wizard Mode
-if [[ "$1" == "--wizard" ]]; then
-  echo -e "${PURPLE}🧙 RoverNet Wizard Mode${RESET}"
-  echo "Available Models:"
-  mapfile -t MODEL_LIST < <(find "$MODELS_DIR" -type f -name "*.gguf")
-  for i in "${!MODEL_LIST[@]}"; do
-    echo -e "  $((i + 1)). ${MODEL_LIST[$i]}"
-  done
+# AI Mode Functions
+run_local_ai() {
+    local model="$1"
+    local prompt="$2"
+    local sys_msg="$3"
 
-  echo -n $'\nChoose a model (number or name): '
-  read MODEL_CHOICE
-  if [[ "$MODEL_CHOICE" =~ ^[0-9]+$ ]]; then
-    MODEL="${MODEL_LIST[$((MODEL_CHOICE - 1))]}"
-  else
-    MODEL="$MODEL_CHOICE"
-  fi
+    echo -e "${PURPLE}🟪 Local AI Mode${RESET}"
+    echo -e "${CYAN}🎭 Model:${RESET} $model"
+    echo -e "${CYAN}📝 System:${RESET} $sys_msg"
 
-  echo -e "\nDefault system message:\n$ROVERNET_SYSTEM_MSG"
-  read -p $'\nUse default system message? (Y/n): ' SYS_CONFIRM
-  if [[ "$SYS_CONFIRM" =~ ^[Nn]$ ]]; then
-    echo -n "Enter custom system message: "
-    read SYS_MSG
-  else
-    SYS_MSG="$ROVERNET_SYSTEM_MSG"
-  fi
+    if [ -z "$prompt" ]; then
+        echo -e "${RED}No prompt provided. Exiting.${RESET}"
+        return 1
+    fi
 
-  # Default to yes for voice
-  read -p $'\nWould you like the response spoken aloud? (Y/n): ' VOICE_CONFIRM
-  if [[ ! "$VOICE_CONFIRM" =~ ^[Nn]$ ]]; then
-    echo "Available Voices:"
-    echo "  1. en-us (default)"
-    echo "  2. en-uk"
-    echo "  3. en-au"
-    read -p "Choose voice (number or code): " VOICE_CHOICE
-    case "$VOICE_CHOICE" in
-      1 | en-us) VOICE="en-us" ;;
-      2 | en-uk) VOICE="en-uk" ;;
-      3 | en-au) VOICE="en-au" ;;
-      *) VOICE="$DEFAULT_VOICE" ;;
+    # Create a temporary file for the output
+    local temp_output=$(mktemp)
+
+    # Run the model using Ollama API
+    curl -s "$OLLAMA_HOST/api/generate" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"model\": \"$model\",
+            \"prompt\": \"$prompt\",
+            \"system\": \"$sys_msg\",
+            \"stream\": false,
+            \"options\": {
+                \"temperature\": $TEMP,
+                \"num_predict\": $N_PREDICT,
+                \"num_thread\": $THREADS
+            }
+        }" | jq -r '.response' > "$temp_output"
+
+    # Display the output
+    cat "$temp_output"
+
+    # Speak the response
+    if [ -s "$temp_output" ]; then
+        echo -e "${CYAN}Speaking response...${RESET}"
+        cat "$temp_output" | espeak-ng -v "$VOICE" \
+            -p "$AUDIO_VOICE_PARAMS_PITCH" \
+            -s "$AUDIO_VOICE_PARAMS_SPEED" \
+            -g "$AUDIO_VOICE_PARAMS_WORD_GAP" \
+            --stdout | aplay -D "$VOICE_DEVICE" 2>/dev/null || {
+            echo -e "${RED}Warning: Audio playback failed. Continuing without audio.${RESET}"
+        }
+    else
+        echo -e "${YELLOW}Warning: No output to speak${RESET}"
+    fi
+
+    # Clean up
+    rm "$temp_output"
+}
+
+SELECTED_ASSISTANT_ID=""
+select_openai_assistant() {
+    # Use Python to list assistants and prompt for selection
+    SELECTED_ASSISTANT_ID=$(python3 - <<EOF
+import openai, yaml
+with open('$HOME/bin/rovernet_src/config/rovernet.yaml', 'r') as f:
+    config = yaml.safe_load(f)
+api_key = config['environment']['OPENAI_API_KEY']
+client = openai.OpenAI(api_key=api_key)
+assistants = client.beta.assistants.list().data
+if not assistants:
+    print("")
+    exit(1)
+print("\nAvailable OpenAI Assistants:")
+for i, a in enumerate(assistants, 1):
+    print(f"{i}) {a.name} - {a.description}")
+choice = input(f"Select an assistant (1-{len(assistants)}): ")
+try:
+    idx = int(choice) - 1
+    if 0 <= idx < len(assistants):
+        print(assistants[idx].id)
+    else:
+        print("")
+except Exception:
+    print("")
+EOF
+)
+    if [ -z "$SELECTED_ASSISTANT_ID" ]; then
+        echo -e "${RED}No assistant selected. Exiting.${RESET}"
+        exit 1
+    fi
+}
+
+run_openai() {
+    local prompt="$1"
+    local sys_msg="$2"
+    local assistant_id="$3"
+    
+    echo -e "${PURPLE}🟪 OpenAI Mode${RESET}"
+    echo -e "${CYAN}🎭 Model:${RESET} GPT-4"
+    echo -e "${CYAN}📝 System:${RESET} $sys_msg"
+    
+    # Create a temporary file for the output
+    local temp_output=$(mktemp)
+    
+    # Check if this is a request to change assistant
+    if [[ "$prompt" =~ ^[Cc]hange[[:space:]]+assistant ]]; then
+        echo -e "${CYAN}Changing assistant...${RESET}"
+        python3 -c "
+import openai, yaml
+with open('$HOME/bin/rovernet_src/config/rovernet.yaml', 'r') as f:
+    config = yaml.safe_load(f)
+api_key = config['environment']['OPENAI_API_KEY']
+client = openai.OpenAI(api_key=api_key)
+if not client:
+    print('Error: OPENAI_API_KEY not set in config')
+    sys.exit(1)
+
+# List available assistants
+assistants = client.beta.assistants.list()
+print('\nAvailable Assistants:')
+for i, assistant in enumerate(assistants.data, 1):
+    print(f'{i}. {assistant.name} - {assistant.description}')
+
+# Get user selection
+choice = input('\nSelect an assistant (1-{len(assistants.data)}): ')
+try:
+    selected = assistants.data[int(choice) - 1]
+    print(f'\nSelected: {selected.name}')
+    print(f'Description: {selected.description}')
+    
+    # Save the selection
+    with open('$HOME/bin/rovernet_src/config/current_assistant.txt', 'w') as f:
+        f.write(selected.id)
+    
+except Exception as e:
+    print(f'Error selecting assistant: {e}')
+    sys.exit(1)
+" > "$temp_output"
+        
+        # Display the output
+        cat "$temp_output"
+        
+        # Speak the response
+        speak_text "$(cat "$temp_output")"
+        
+        # Clean up
+        rm "$temp_output"
+        return
+    fi
+    
+    # Get the current assistant ID
+    local assistant_id
+    if [ -f "$HOME/bin/rovernet_src/config/current_assistant.txt" ]; then
+        assistant_id=$(cat "$HOME/bin/rovernet_src/config/current_assistant.txt")
+    else
+        echo -e "${RED}No assistant selected. Please run 'change assistant' first.${RESET}"
+        return
+    fi
+    
+    python3 -c "
+import openai, yaml, os, sys
+with open('$HOME/bin/rovernet_src/config/rovernet.yaml', 'r') as f:
+    config = yaml.safe_load(f)
+api_key = config['environment']['OPENAI_API_KEY']
+client = openai.OpenAI(api_key=api_key)
+thread_id = None
+if os.path.exists('$HOME/bin/rovernet_src/config/current_thread.txt'):
+    thread_id = open('$HOME/bin/rovernet_src/config/current_thread.txt').read().strip()
+if not thread_id:
+    thread = client.beta.threads.create()
+    thread_id = thread.id
+    with open('$HOME/bin/rovernet_src/config/current_thread.txt', 'w') as f:
+        f.write(thread_id)
+client.beta.threads.messages.create(thread_id=thread_id, role='user', content='''$prompt''')\nrun = client.beta.threads.runs.create(thread_id=thread_id, assistant_id='$assistant_id')\nimport time\nwhile True:\n    run_status = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)\n    if run_status.status == 'completed':\n        break\n    elif run_status.status == 'failed':\n        raise Exception('Run failed')\n    time.sleep(0.5)\nmessages = client.beta.threads.messages.list(thread_id=thread_id, order='desc', limit=1)\nprint(messages.data[0].content[0].text.value)" > "$temp_output"
+    
+    # Display the output
+    cat "$temp_output"
+    
+    # Speak the response
+    speak_text "$(cat "$temp_output")"
+    
+    # Clean up
+    rm "$temp_output"
+}
+
+run_penphin() {
+    local prompt="$1"
+    
+    echo -e "${PURPLE}🟪 Penphin Mode${RESET}"
+    echo -e "${CYAN}🎭 Agents:${RESET} Dolphin (Logic) + Penguin (Creative) + Synthesis"
+    
+    # Create a temporary file for the output
+    local temp_output=$(mktemp)
+    
+    python3 -c "
+from src.penphin.dolphin_agent import DolphinAgent
+from src.penphin.penguin_agent import PenguinAgent
+from src.penphin.synth_engine import SynthEngine
+
+try:
+    # Initialize agents
+    dolphin = DolphinAgent()
+    penguin = PenguinAgent()
+    synth = SynthEngine()
+    
+    # Get responses
+    print('\n🐬 Dolphin thinking...')
+    dolphin_reply = dolphin.process_prompt('$prompt')
+    print(f'Dolphin: {dolphin_reply}\n')
+    
+    print('🐧 Penguin thinking...')
+    penguin_reply = penguin.process_prompt('$prompt')
+    print(f'Penguin: {penguin_reply}\n')
+    
+    print('🧠 Synthesizing...')
+    final = synth.synthesize('$prompt', dolphin_reply, penguin_reply)
+    print(f'\n🎤 Penphin says:\n{final}')
+    
+except Exception as e:
+    print(f'Error: {str(e)}')
+    exit(1)
+" > "$temp_output"
+    
+    # Display the output
+    cat "$temp_output"
+    
+    # Speak the response
+    speak_text "$(cat "$temp_output")"
+    
+    # Clean up
+    rm "$temp_output"
+}
+
+# List available models
+SELECTED_MODEL=""
+list_models() {
+    echo -e "${CYAN}Available Models:${RESET}"
+    local models=()
+    local i=1
+
+    # Get list of models from Ollama
+    while IFS= read -r model; do
+        models+=("$model")
+        echo -e "${GREEN}$i)${RESET} $model"
+        ((i++))
+    done < <(curl -s "$OLLAMA_HOST/api/tags" | jq -r '.models[].name')
+
+    if [ ${#models[@]} -eq 0 ]; then
+        echo -e "${RED}No models found. Please pull a model first with:${RESET}"
+        echo -e "${YELLOW}ollama pull tinyllama${RESET}"
+        SELECTED_MODEL=""
+        return 1
+    fi
+
+    echo
+    local choice
+    while true; do
+        echo -n "Select a model (1-$((i-1))): "
+        read choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -lt "$i" ]; then
+            SELECTED_MODEL="${models[$((choice-1))]}"
+            return 0
+        else
+            echo -e "${RED}Invalid selection. Please try again.${RESET}"
+        fi
+    done
+}
+
+# Main menu
+show_menu() {
+    echo -e "${PURPLE}🤖 RoverNet AI Interface${RESET}"
+    echo "1. Local AI Mode"
+    echo "2. OpenAI Mode"
+    echo "3. Penphin Mode (Bicameral)"
+    echo "4. Exit"
+    echo -n "Choose mode (1-4): "
+}
+
+# Local AI conversational loop
+run_local_ai_conversation() {
+    local model="$1"
+    local sys_msg="$2"
+    CONVERSATION_HISTORY=""
+    
+    # Create a temporary Python script for streaming
+    local temp_script=$(mktemp)
+    cat > "$temp_script" << 'EOF'
+#!/usr/bin/env python3
+import sys
+from src.rovernet.stream_tts import StreamTTS
+
+def main():
+    stts = StreamTTS()
+    while True:
+        try:
+            user_input = input("You: ").strip()
+            if not user_input:
+                break
+            stts.chat(user_input, sys.argv[1] if len(sys.argv) > 1 else None)
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            print(f"Error: {str(e)}", file=sys.stderr)
+            break
+
+if __name__ == "__main__":
+    main()
+EOF
+    
+    chmod +x "$temp_script"
+    
+    # Run the streaming conversation
+    python3 "$temp_script" "$sys_msg"
+    
+    # Clean up
+    rm "$temp_script"
+}
+
+# OpenAI conversational loop
+run_openai_conversation() {
+    local sys_msg="$1"
+    local assistant_id="$2"
+    CONVERSATION_HISTORY=""
+    while true; do
+        echo -n "You: "
+        read user_input
+        [ -z "$user_input" ] && break
+        # Append user input to history
+        CONVERSATION_HISTORY+="[USER] $user_input\n"
+        local temp_output=$(mktemp)
+        python3 -c "import openai, yaml, os, sys\nwith open('$HOME/bin/rovernet_src/config/rovernet.yaml', 'r') as f:\n    config = yaml.safe_load(f)\napi_key = config['environment']['OPENAI_API_KEY']\nclient = openai.OpenAI(api_key=api_key)\nthread_id = None\nif os.path.exists('$HOME/bin/rovernet_src/config/current_thread.txt'):\n    thread_id = open('$HOME/bin/rovernet_src/config/current_thread.txt').read().strip()\nif not thread_id:\n    thread = client.beta.threads.create()\n    thread_id = thread.id\n    with open('$HOME/bin/rovernet_src/config/current_thread.txt', 'w') as f:\n        f.write(thread_id)\nclient.beta.threads.messages.create(thread_id=thread_id, role='user', content='''$user_input''')\nrun = client.beta.threads.runs.create(thread_id=thread_id, assistant_id='$assistant_id')\nimport time\nwhile True:\n    run_status = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)\n    if run_status.status == 'completed':\n        break\n    elif run_status.status == 'failed':\n        raise Exception('Run failed')\n    time.sleep(0.5)\nmessages = client.beta.threads.messages.list(thread_id=thread_id, order='desc', limit=1)\nprint(messages.data[0].content[0].text.value)" > "$temp_output"
+        local response=$(cat "$temp_output")
+        echo -e "AI: $response"
+        speak_text "$response"
+        # Append AI response to history
+        CONVERSATION_HISTORY+="[AI] $response\n"
+        rm "$temp_output"
+    done
+}
+
+# Penphin conversational loop
+run_penphin_conversation() {
+    CONVERSATION_HISTORY=""
+    while true; do
+        echo -n "You: "
+        read user_input
+        [ -z "$user_input" ] && break
+        # Append user input to history
+        CONVERSATION_HISTORY+="[USER] $user_input\n"
+        local temp_output=$(mktemp)
+        python3 -c "from src.penphin.dolphin_agent import DolphinAgent\nfrom src.penphin.penguin_agent import PenguinAgent\nfrom src.penphin.synth_engine import SynthEngine\ntry:\n    dolphin = DolphinAgent()\n    penguin = PenguinAgent()\n    synth = SynthEngine()\n    print('\\n🐬 Dolphin thinking...')\n    dolphin_reply = dolphin.process_prompt('''$CONVERSATION_HISTORY''')\n    print(f'Dolphin: {dolphin_reply}\\n')\n    print('🐧 Penguin thinking...')\n    penguin_reply = penguin.process_prompt('''$CONVERSATION_HISTORY''')\n    print(f'Penguin: {penguin_reply}\\n')\n    print('🧠 Synthesizing...')\n    final = synth.synthesize('''$CONVERSATION_HISTORY''', dolphin_reply, penguin_reply)\n    print(f'\\n🎤 Penphin says:\\n{final}')\nexcept Exception as e:\n    print(f'Error: {str(e)}')\n    exit(1)" > "$temp_output"
+        local response=$(cat "$temp_output" | grep '🎤 Penphin says:' -A 1 | tail -n 1)
+        echo -e "Penphin: $response"
+        speak_text "$response"
+        # Append Penphin response to history
+        CONVERSATION_HISTORY+="[PENPHIN] $response\n"
+        rm "$temp_output"
+    done
+}
+
+# Main loop
+while true; do
+    show_menu
+    read choice
+    
+    case $choice in
+        1)
+            echo -e "${CYAN}Loading available models...${RESET}"
+            list_models
+            if [ -z "$SELECTED_MODEL" ]; then
+                echo -e "${RED}No model selected. Exiting.${RESET}"
+                exit 1
+            fi
+            echo -e "${GREEN}Selected model:${RESET} $(basename "$SELECTED_MODEL")"
+            run_local_ai_conversation "$SELECTED_MODEL" "$ROVERNET_SYSTEM_MSG"
+            ;;
+        2)
+            echo -e "${CYAN}Loading available assistants...${RESET}"
+            select_openai_assistant
+            echo -e "${GREEN}Selected assistant:${RESET} $SELECTED_ASSISTANT_ID"
+            run_openai_conversation "$ROVERNET_SYSTEM_MSG" "$SELECTED_ASSISTANT_ID"
+            ;;
+        3)
+            run_penphin_conversation
+            ;;
+        4)
+            echo "Goodbye!"
+            exit 0
+            ;;
+        *)
+            echo "Invalid choice"
+            ;;
     esac
-  fi
-
-  echo -n "Enter your prompt: "
-  read PROMPT
-
-  run_model
-  exit
-fi
-
-# Arg-based usage
-for ARG in "$@"; do
-  case $ARG in
-    --model=*) MODEL="${ARG#*=}" ;;
-    --prompt=*) PROMPT="${ARG#*=}" ;;
-    --system=*) SYS_MSG="${ARG#*=}" ;;
-    --voice=*) VOICE="${ARG#*=}" ;;
-    --help) show_help; exit ;;
-  esac
+    
+    echo
 done
-
-MODEL="${MODEL:-$DEFAULT_MODEL}"
-SYS_MSG="${SYS_MSG:-$ROVERNET_SYSTEM_MSG}"
-
-if [[ -z "$PROMPT" ]]; then
-  echo -n "Enter your prompt: "
-  read PROMPT
-fi
-
-run_model

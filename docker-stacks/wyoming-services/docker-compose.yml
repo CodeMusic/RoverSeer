@@ -1,0 +1,26 @@
+version: "3.3"
+
+services:
+  wyoming-piper:
+    image: rhasspy/wyoming-piper:latest
+    container_name: wyoming-piper
+    network_mode: host
+    restart: unless-stopped
+    command: >
+      --voice en_US-lessac-medium
+      --data-dir /data
+      --uri tcp://0.0.0.0:10200
+    volumes:
+      - /home/codemusic/docker-stacks/wyoming-services/piper-data:/data
+
+  wyoming-whisper:
+    image: rhasspy/wyoming-whisper:latest
+    container_name: wyoming-whisper
+    network_mode: host
+    restart: unless-stopped
+    command: >
+      --model medium
+      --language en
+      --uri tcp://0.0.0.0:10300
+    volumes:
+      - /home/codemusic/docker-stacks/wyoming-services/whisper-models:/data

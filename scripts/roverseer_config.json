@@ -1,0 +1,6 @@
+import json
+
+with open('/home/codemusic/roverseer_config.json') as f:
+    config = json.load(f)
+
+AUDIO_DEVICE = config.get("aplay_device", "default")

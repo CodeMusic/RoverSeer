@@ -1,0 +1,151 @@
+#!/bin/bash
+
+LLAMA_BIN="$HOME/llama.cpp/build/bin/llama-cli"
+MODELS_DIR="$HOME/llama.cpp/models"
+DEFAULT_MODEL="$MODELS_DIR/deepseek/deepseek-coder-1.3b-instruct.Q4_K_M.gguf"
+DEFAULT_VOICE="en-us"
+VOICE_DEVICE="plughw:0,0"
+N_PREDICT=200
+THREADS=4
+TEMP=0.91
+
+# Default system message
+ROVERNET_SYSTEM_MSG=${ROVERNET_SYSTEM_MSG:-"You are a helpful, digital lifeform."}
+
+# Terminal colors
+PURPLE='\033[1;35m'
+BLUE='\033[1;34m'
+CYAN='\033[1;36m'
+RED='\033[1;31m'
+RESET='\033[0m'
+
+show_help() {
+  echo -e "${BLUE}Usage:${RESET} rovernet [--model=FILE] [--prompt='TEXT'] [--system='SYSMSG'] [--voice=en-us|en-uk|en-au] [--wizard]"
+}
+
+speak_text() {
+  local text="$1"
+  if [[ -n "$VOICE" ]]; then
+    # Handle special markers
+    text=$(echo "$text" | sed -E '
+      s/<SYS>.*<\/SYS>/system note/g;
+      s/\[INST\].*\[\/INST\]/instructions complete/g;
+      s/<think>.*<\/think>/let me think about that/g;
+      s/\[end of text\]//g;
+      s/\[end\]//g
+    ')
+    
+    # Only speak if there's actual content after processing
+    if [[ -n "$text" && ! "$text" =~ ^[[:space:]]*$ ]]; then
+      echo "$text" | espeak-ng -v "$VOICE" --stdout | aplay -D "$VOICE_DEVICE" 2>/dev/null || {
+        echo -e "${RED}Warning: Audio playback failed. Continuing without audio.${RESET}"
+      }
+    fi
+  fi
+}
+
+run_model() {
+  echo -e "${PURPLE}🟪 Model Active:${RESET} $MODEL"
+  echo -e "${CYAN}🎭 Persona:${RESET} $SYS_MSG"
+  echo -e "${CYAN}📏 Limit:${RESET}  --n-predict=$N_PREDICT"
+  [[ -n "$VOICE" ]] && echo -e "${CYAN}🔊 Voice:${RESET} $VOICE (Device: $VOICE_DEVICE)"
+  echo ""
+
+  while true; do
+    if [[ -z "$PROMPT" ]]; then
+      echo -n "You: "
+      read PROMPT
+      [[ -z "$PROMPT" ]] && continue
+    fi
+
+    # Create a named pipe for streaming
+    PIPE=$(mktemp -u)
+    mkfifo "$PIPE"
+
+    # Start the model in the background
+    "$LLAMA_BIN" \
+      -m "$MODEL" \
+      -p "[INST] <<SYS>>$SYS_MSG<</SYS>> $PROMPT [/INST]" \
+      --n-predict "$N_PREDICT" \
+      --color \
+      --temp "$TEMP" \
+      --threads "$THREADS" > "$PIPE" &
+
+    echo -e "\n${PURPLE}Assistant:${RESET}"
+    # Process the stream
+    while IFS= read -r line; do
+      echo "$line"
+      if [[ -n "$VOICE" ]]; then
+        speak_text "$line"
+      fi
+    done < "$PIPE"
+
+    # Clean up
+    rm "$PIPE"
+    
+    # Clear prompt for next iteration
+    PROMPT=""
+  done
+}
+
+# Wizard Mode
+if [[ "$1" == "--wizard" ]]; then
+  echo -e "${PURPLE}🧙 RoverNet Wizard Mode${RESET}"
+  echo "Available Models:"
+  mapfile -t MODEL_LIST < <(find "$MODELS_DIR" -type f -name "*.gguf")
+  for i in "${!MODEL_LIST[@]}"; do
+    echo -e "  $((i + 1)). ${MODEL_LIST[$i]}"
+  done
+
+  echo -n $'\nChoose a model (number or name): '
+  read MODEL_CHOICE
+  if [[ "$MODEL_CHOICE" =~ ^[0-9]+$ ]]; then
+    MODEL="${MODEL_LIST[$((MODEL_CHOICE - 1))]}"
+  else
+    MODEL="$MODEL_CHOICE"
+  fi
+
+  echo -e "\nDefault system message:\n$ROVERNET_SYSTEM_MSG"
+  read -p $'\nUse default system message? (Y/n): ' SYS_CONFIRM
+  if [[ "$SYS_CONFIRM" =~ ^[Nn]$ ]]; then
+    echo -n "Enter custom system message: "
+    read SYS_MSG
+  else
+    SYS_MSG="$ROVERNET_SYSTEM_MSG"
+  fi
+
+  # Default to yes for voice
+  read -p $'\nWould you like the response spoken aloud? (Y/n): ' VOICE_CONFIRM
+  if [[ ! "$VOICE_CONFIRM" =~ ^[Nn]$ ]]; then
+    echo "Available Voices:"
+    echo "  1. en-us (default)"
+    echo "  2. en-uk"
+    echo "  3. en-au"
+    read -p "Choose voice (number or code): " VOICE_CHOICE
+    case "$VOICE_CHOICE" in
+      1 | en-us) VOICE="en-us" ;;
+      2 | en-uk) VOICE="en-uk" ;;
+      3 | en-au) VOICE="en-au" ;;
+      *) VOICE="$DEFAULT_VOICE" ;;
+    esac
+  fi
+
+  run_model
+  exit
+fi
+
+# Arg-based usage
+for ARG in "$@"; do
+  case $ARG in
+    --model=*) MODEL="${ARG#*=}" ;;
+    --prompt=*) PROMPT="${ARG#*=}" ;;
+    --system=*) SYS_MSG="${ARG#*=}" ;;
+    --voice=*) VOICE="${ARG#*=}" ;;
+    --help) show_help; exit ;;
+  esac
+done
+
+MODEL="${MODEL:-$DEFAULT_MODEL}"
+SYS_MSG="${SYS_MSG:-$ROVERNET_SYSTEM_MSG}"
+
+run_model
