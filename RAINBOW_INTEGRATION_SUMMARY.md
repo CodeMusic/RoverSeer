@@ -182,4 +182,29 @@ python test_roverseer.py
 - **A**: Previous Model (←) / Interrupt Audio
 - **B**: Record & Process (●) / Interrupt Audio
 - **C**: Next Model (→) / Interrupt Audio
-- **A+B+C**: Clear History (hold 3 seconds) 
+- **A+B+C**: Clear History (hold 3 seconds)
+
+## Recent Fixes (Latest Update)
+
+### Display Layering
+- **Scrolling takes precedence**: When text is scrolling, it completely overrides number display
+- **Numbers are bottom layer**: Timer and other numbers only show when scrolling is not active
+- **Smooth transitions**: Code waits for scrolling to complete before showing numbers
+
+### LED Pipeline Fixes
+- **Recording**: Button B LED blinks during 10-second recording
+- **ASR (Speech-to-Text)**: Button A (Red) LED blinks, then stays solid when complete
+- **LLM Processing**: Button B (Green) LED blinks, with A solid red
+- **TTS (Text-to-Speech)**: Button C (Blue) LED blinks, with A & B solid
+- **Audio Playback**: All three LEDs blink together
+- **Completion**: All LEDs turn off when pipeline completes
+
+### Timer Sound Improvements
+- **Increased duration**: Tick sounds play for 0.05s (clock) and 0.04s (music) for better audibility
+- **Clock mode**: Alternating E5 (tick) and C4 (tock) tones
+- **Music mode**: Pentatonic scale progression with variation
+
+### Code Simplification
+- Uses rainbow driver's `display_number()` method directly
+- Leverages built-in buzzer tones from the driver
+- Cleaner state management with global `isScrolling` flag 

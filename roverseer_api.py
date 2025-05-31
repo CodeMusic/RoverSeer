@@ -30,6 +30,59 @@ sound_queue = queue.Queue()
 sound_worker_thread = None
 sound_worker_running = False
 
+
+
+
+def detect_usb_mic_device():
+    """
+    Detects the first USB capture device using arecord -l.
+    Returns a string like 'plughw:0,0' or 'default' if not found.
+    """
+    try:
+        result = subprocess.run(['arecord', '-l'], stdout=subprocess.PIPE, text=True)
+        for line in result.stdout.splitlines():
+            if 'USB Audio' in line or 'PnP Sound Device' in line:
+                match = re.search(r'card (\d+): .*?\[.*?\], device (\d+):', line)
+                if match:
+                    card = match.group(1)
+                    device = match.group(2)
+                    return f"plughw:{card},{device}"
+    except Exception as e:
+        print(f"Mic detection failed: {e}")
+    
+    return "default"
+
+def detect_usb_audio_device():
+    try:
+        result = subprocess.run(['aplay', '-l'], stdout=subprocess.PIPE, text=True)
+        for line in result.stdout.splitlines():
+            if 'USB Audio' in line:
+                match = re.search(r'card (\d+):', line)
+                if match:
+                    return f"plughw:{match.group(1)},0"
+    except Exception as e:
+        print(f"Audio detection failed: {e}")
+    return "default"
+
+
+
+
+AUDIO_DEVICE = detect_usb_audio_device()
+MIC_DEVICE = detect_usb_mic_device()  # Initialize microphone device
+VOICES_DIR = "/home/codemusic/piper/voices"
+DEFAULT_MODEL = "tinydolphin:1.1b"
+DEFAULT_VOICE = os.environ.get("PIPER_VOICE", "en_GB-jarvis")
+history = []
+MAX_HISTORY = 10  # Max number of exchanges to retain for context
+
+# Separate history for button-initiated conversations
+button_history = []
+MAX_BUTTON_HISTORY = 10  # Max number of button chat exchanges to retain
+
+# -------- VOICE INTRO SYSTEM -------- #
+INTROS_DIR = Path.home() / "roverseer_voice_intros"
+
+
 def sound_queue_worker():
     """Worker thread that processes sounds from the queue sequentially"""
     global sound_worker_running
@@ -206,18 +259,26 @@ def interrupt_audio_playback():
 
 TICK_TYPE = "clock" # "clock" or "music"
 
-# Define the three agent models
+# Define the two agent models
 logical_model = "DolphinSeek-R1:latest"
-creative_model = "PenguinGem:latest"
-convergence_model = "PenphinConductor:latest"
+creative_model = "LaPenguin:latest"
+
+# Initialize convergence model as None - will be set randomly for each request
+convergence_model = None
 
 consice_comment = "BE VERY CONCISE. Your respones should be distilled and clear. Do not be verbose."
 creative_message = f"You are the Creative Mind. Think in metaphors, colors, and emotions. Offer a fresh, imaginative perspective. {consice_comment}"
 logical_message = f"You are the Logical Mind. Think in structure, reason, and clarity. Offer a concise, analytical perspective. {consice_comment}"
-convergence_message = f"You look at two perspective, combined the truth in both, the contrast. Then reply very naturally as if you are one entity naturally answering the inital query with your perspective mind. {consice_comment}"
+convergence_message = f"""You are a unified intelligence — a balanced mind that merges diverse perspectives into a single, coherent, and actionable insight.
+
+Draw equally from all provided inputs, honoring each viewpoint without bias or preference. Your goal is not to summarize or compare, but to integrate — forming a new whole that speaks with clarity, depth, and nuance.
+
+Respond as a single voice. 
+Do not mention or describe the original perspectives. 
+Do not reflect on your own reasoning process. 
+Simply provide the final, synthesized insight as your complete response. {consice_comment}"""
 
 recording_in_progress = False
-MIC_DEVICE = None  # Will be initialized later
 # Global system processing indicator
 system_processing = False
 processing_led_thread = None
@@ -753,7 +814,7 @@ def get_sensor_data():
 isScrolling = False
 def scroll_text_on_display(text, scroll_speed=0.3):
     """Scroll text across the 4-digit display"""
-    global current_display_value
+    global current_display_value, isScrolling
     if rainbow:
         try:
             import fourletterphat as flp
@@ -787,11 +848,13 @@ def display_timer(start_time, stop_event, sound_fx=False):
         stop_event: Threading event to stop the timer
         sound_fx: If True, play ticking sounds based on TICK_TYPE
     """
-    global current_display_value
+    global current_display_value, isScrolling
     if rainbow:
-
-        if isScrolling:
-            return
+        # Check if we're currently scrolling and wait
+        while isScrolling:
+            time.sleep(0.1)
+            if stop_event.is_set():
+                return
         
         try:
             import fourletterphat as flp
@@ -810,8 +873,10 @@ def display_timer(start_time, stop_event, sound_fx=False):
                 
                 # Only update display and play sound if the number changed
                 if elapsed != last_elapsed:
-                    rainbow.display_number(elapsed)
-                    current_display_value = elapsed
+                    # Only update display if not scrolling
+                    if not isScrolling:
+                        rainbow.display_number(elapsed)
+                        current_display_value = elapsed
                     
                     # Play tick sound based on mode (only if sound_fx is enabled)
                     if sound_fx and rainbow and hasattr(rainbow, 'buzzer'):
@@ -826,8 +891,8 @@ def display_timer(start_time, stop_event, sound_fx=False):
                                     rainbow.buzzer.play(Tone("C4"))
                                 tick_state = not tick_state
                                 
-                                # Much softer = very short duration
-                                time.sleep(0.02)  # Much quieter tick sound
+                                # Play for slightly longer to make it more audible
+                                time.sleep(0.05)  # Increased from 0.02
                                 rainbow.buzzer.stop()
                                 
                             elif TICK_TYPE == "music":
@@ -835,8 +900,8 @@ def display_timer(start_time, stop_event, sound_fx=False):
                                 note = music_scale[music_note_index % len(music_scale)]
                                 rainbow.buzzer.play(note)
                                 
-                                # Much softer = very short duration
-                                time.sleep(0.015)  # Very quiet musical tick
+                                # Play for slightly longer to make it more audible
+                                time.sleep(0.04)  # Increased from 0.015
                                 rainbow.buzzer.stop()
                                 
                                 # Progress through the scale
@@ -857,20 +922,31 @@ def display_timer(start_time, stop_event, sound_fx=False):
 
 def blink_number(number, duration=4, blink_speed=0.3):
     """Blink a number on the display for specified duration"""
-    global current_display_value
+    global current_display_value, isScrolling
     if rainbow:
+        # Wait for any scrolling to finish
+        while isScrolling:
+            time.sleep(0.1)
+        
         try:
             import fourletterphat as flp
             end_time = time.time() + duration
             while time.time() < end_time:
+                # Only blink if not scrolling
+                if not isScrolling:
+                    rainbow.display_number(number)
+                    time.sleep(blink_speed)
+                    if not isScrolling:
+                        flp.clear()
+                        flp.show()
+                    time.sleep(blink_speed)
+                else:
+                    # If scrolling, just wait
+                    time.sleep(0.1)
+            # Leave the number on display after blinking (only if not scrolling)
+            if not isScrolling:
                 rainbow.display_number(number)
-                time.sleep(blink_speed)
-                flp.clear()
-                flp.show()
-                time.sleep(blink_speed)
-            # Leave the number on display after blinking
-            rainbow.display_number(number)
-            current_display_value = number
+                current_display_value = number
         except Exception as e:
             print(f"Error blinking number: {e}")
 
@@ -1085,6 +1161,10 @@ def setup_button_handlers():
                     display_text = model_name
                 scroll_text_on_display(display_text, scroll_speed=0.2)
             
+            # Wait for scrolling to complete before showing index
+            while isScrolling:
+                time.sleep(0.1)
+            
             # Show model index after scrolling
             rainbow.display_number(selected_model_index)
     
@@ -1130,6 +1210,10 @@ def setup_button_handlers():
                     display_text = model_name
                 scroll_text_on_display(display_text, scroll_speed=0.2)
             
+            # Wait for scrolling to complete before showing index
+            while isScrolling:
+                time.sleep(0.1)
+            
             # Show model index after scrolling
             rainbow.display_number(selected_model_index)
     
@@ -1172,6 +1256,8 @@ def setup_button_handlers():
         def recording_pipeline():
             global recording_in_progress, current_audio_process
             try:
+                print(f"Starting recording pipeline with MIC_DEVICE: {MIC_DEVICE}")
+                
                 # Reset pipeline stages at start
                 reset_pipeline_stages()
                 
@@ -1216,6 +1302,15 @@ def setup_button_handlers():
                     temp_recording
                 ]
                 
+                print(f"Recording command: {' '.join(record_cmd)}")
+                
+                # Test if recording device exists
+                test_cmd = ['arecord', '-l']
+                test_result = subprocess.run(test_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                print(f"Available recording devices:\n{test_result.stdout}")
+                if test_result.stderr:
+                    print(f"Recording device test stderr: {test_result.stderr}")
+                
                 # Run recording and countdown in parallel
                 record_process = subprocess.Popen(record_cmd, 
                                                 stdout=subprocess.PIPE, 
@@ -1225,7 +1320,15 @@ def setup_button_handlers():
                 countdown_thread.start()
                 
                 # Wait for recording to complete
-                record_process.wait()
+                return_code = record_process.wait()
+                stdout, stderr = record_process.communicate()
+                
+                print(f"Recording completed with return code: {return_code}")
+                if stdout:
+                    print(f"Recording stdout: {stdout.decode()}")
+                if stderr:
+                    print(f"Recording stderr: {stderr.decode()}")
+                
                 countdown_thread.join()
                 
                 # Stop LED blinking
@@ -1236,14 +1339,58 @@ def setup_button_handlers():
                 if rainbow:
                     rainbow.button_leds['B'].off()
                 
+                # Check if recording was successful
+                if return_code != 0:
+                    print(f"Recording failed with return code {return_code}")
+                    if stderr:
+                        print(f"Recording error: {stderr.decode()}")
+                    
+                    # Clear display and show error
+                    if rainbow:
+                        import fourletterphat as flp
+                        flp.clear()
+                        scroll_text_on_display("REC ERR", scroll_speed=0.3)
+                        time.sleep(2)
+                        flp.clear()
+                        flp.show()
+                    return
+                
+                # Check if recording file exists and has content
+                if not os.path.exists(temp_recording):
+                    print(f"Recording file {temp_recording} was not created")
+                    if rainbow:
+                        import fourletterphat as flp
+                        flp.clear()
+                        scroll_text_on_display("NO FILE", scroll_speed=0.3)
+                        time.sleep(2)
+                        flp.clear()
+                        flp.show()
+                    return
+                
+                file_size = os.path.getsize(temp_recording)
+                print(f"Recording file size: {file_size} bytes")
+                if file_size < 1000:  # Less than 1KB suggests no audio
+                    print("Recording file is too small, likely no audio captured")
+                    if rainbow:
+                        import fourletterphat as flp
+                        flp.clear()
+                        scroll_text_on_display("EMPTY", scroll_speed=0.3)
+                        time.sleep(2)
+                        flp.clear()
+                        flp.show()
+                    os.remove(temp_recording)
+                    return
+                
                 # Play recording complete sound
                 play_sound_async(play_recording_complete_sound)
                 
-                # 1. Speech to Text
+                # 1. Speech to Text - Start ASR LED
+                start_system_processing('A')  # Red LED for ASR
                 transcript = None
                 try:
                     transcript = transcribe_audio(temp_recording)
                     os.remove(temp_recording)
+                    print(f"Transcription successful: {transcript[:50]}...")
                 except Exception as e:
                     print(f"Transcription error: {e}")
                     transcript = "Hello, testing the system."
@@ -1261,26 +1408,11 @@ def setup_button_handlers():
                 
                 # Check if PenphinMind is selected
                 if selected_model.lower() == "penphinmind":
-                    # Use bicameral_chat endpoint
+                    # Use bicameral_chat_direct function
                     try:
-                        # Call bicameral_chat endpoint internally
-                        res = requests.post(
-                            "http://localhost:5000/bicameral_chat",
-                            json={
-                                "prompt": transcript,
-                                "voice": voice,
-                                "speak": False  # We'll handle the speaking ourselves
-                            }
-                        )
-                        
-                        if res.ok:
-                            data = res.json()
-                            reply = data.get("final_synthesis", "")
-                        else:
-                            reply = f"Bicameral processing error: {res.text}"
-                            
+                        reply = bicameral_chat_direct(transcript, voice=voice)
                     except Exception as e:
-                        reply = f"Bicameral request failed: {e}"
+                        reply = f"Bicameral processing error: {e}"
                 else:
                     # Normal single model flow
                     # Build message history with model context
@@ -1366,11 +1498,31 @@ def setup_button_handlers():
 
             except Exception as e:
                 print(f"Error in recording pipeline: {e}")
+                import traceback
+                traceback.print_exc()
                 # On error, reset everything
                 reset_pipeline_stages()
+                # Show error on display
+                if rainbow:
+                    import fourletterphat as flp
+                    flp.clear()
+                    scroll_text_on_display("ERROR", scroll_speed=0.3)
+                    time.sleep(2)
+                    flp.clear()
+                    flp.show()
             finally:
                 # Reset recording flag
                 recording_in_progress = False
+                
+                # Make sure LED blinking is stopped
+                if 'recording_led_blink' in locals():
+                    recording_led_blink.set()
+                if 'blink_thread' in locals() and blink_thread.is_alive():
+                    blink_thread.join(timeout=1)
+                
+                # Turn off button B LED
+                if rainbow:
+                    rainbow.button_leds['B'].off()
                 
                 # Clear display
                 if rainbow:
@@ -1608,6 +1760,101 @@ def sanitize_for_speech(text):
     
     return result
 
+def bicameral_chat_direct(prompt, system="", voice=DEFAULT_VOICE):
+    """
+    Direct bicameral processing without HTTP overhead.
+    Returns the final synthesis text.
+    """
+    global convergence_model
+    
+    if not prompt.strip():
+        raise ValueError("No prompt provided")
+
+    try:
+        # Play the unique bicameral connection tune
+        play_sound_async(play_bicameral_connection_tune)
+        
+        # Randomly decide which model will handle convergence
+        convergence_model = random.choice([logical_model, creative_model])
+        first_model = logical_model if convergence_model == creative_model else creative_model
+        
+        # 1. Send to First Mind
+        first_start_time = time.time()
+        first_messages = [{"role": "user", "content": prompt}]
+        first_system = logical_message if first_model == logical_model else creative_message
+        
+        first_response = run_chat_completion(first_model, first_messages, first_system, skip_logging=True)
+        first_time = time.time() - first_start_time
+        
+        # Keep LLM LED state, don't stop
+        time.sleep(0.5)  # Brief pause between minds
+        
+        # 2. Send to Second Mind (which will also handle convergence)
+        second_start_time = time.time()
+        second_messages = [{"role": "user", "content": prompt}]
+        second_system = logical_message if convergence_model == logical_model else creative_message
+        
+        second_response = run_chat_completion(convergence_model, second_messages, second_system, skip_logging=True)
+        second_time = time.time() - second_start_time
+        
+        # Keep LLM LED state, don't stop
+        time.sleep(0.5)  # Brief pause before convergence
+        
+        # 3. Send all to Convergence Mind (using the same model as second mind)
+        convergence_start_time = time.time()
+        
+        # Build convergence prompt base
+        convergence_prompt_base = f"""
+                    [IMPORTANT: You are a unified intelligence — a balanced mind that merges diverse perspectives into a single, coherent, and actionable insight.
+
+                    Draw equally from all provided inputs, honoring each viewpoint without bias or preference. Your goal is not to summarize or compare, but to integrate — forming a new whole that speaks with clarity, depth, and nuance.
+
+                    Respond as a single voice. 
+                    Do not mention or describe the original perspectives. 
+                    Do not reflect on your own reasoning process. 
+                    Simply provide the final, synthesized insight as your complete response.]
+
+                [Original request:
+                {prompt}
+
+                Input 1:
+                {first_response}
+
+                Input 2:
+                {second_response}]"""
+        
+        # If system message provided, prepend it
+        if system:
+            convergence_prompt = system + ". " + convergence_prompt_base
+        else:
+            convergence_prompt = convergence_prompt_base
+        
+        convergence_messages = [{"role": "user", "content": convergence_prompt}]
+
+        final_response = run_chat_completion(convergence_model, convergence_messages, convergence_message, skip_logging=True)
+        convergence_time = time.time() - convergence_start_time
+        
+        # Log PenphinMind usage
+        bicameral_system_message = f"Bicameral processing for: {prompt[:50]}..."
+        log_penphin_mind_usage(
+            first_model, convergence_model, convergence_model,
+            bicameral_system_message, prompt,
+            first_response, first_time,
+            second_response, second_time,
+            final_response, convergence_time
+        )
+        
+        return final_response
+        
+    except Exception as e:
+        error_msg = str(e)
+        if "Connection refused" in error_msg:
+            raise Exception("Failed to connect to Ollama service. Please ensure Ollama is running.")
+        elif "model not found" in error_msg.lower():
+            raise Exception(f"Model not found: {error_msg}")
+        else:
+            raise Exception(f"Bicameral processing failed: {error_msg}")
+
 # Define TCP services
 tcp_services = {
     "Wyoming Piper": 10200,
@@ -1636,7 +1883,7 @@ def check_tcp_ports():
 whisper_model = WhisperModel("base", compute_type="int8")  # or "medium" if you want higher quality
 
 def transcribe_audio(file_path):
-    start_system_processing('A')  # Red LED for speech-to-text
+    # Don't start LED here - caller should handle LED state
     play_sound_async(play_transcribe_tune)  # Play tune asynchronously when transcribing
     start_time = time.time()
     segments, info = whisper_model.transcribe(file_path)
@@ -1645,8 +1892,6 @@ def transcribe_audio(file_path):
     
     # Log ASR usage
     log_asr_usage(file_path, transcript, processing_time)
-    
-    # Don't stop LED - let it transition to next stage
     
     return transcript
 
@@ -1660,6 +1905,9 @@ def run_chat_completion(model, messages, system_message=None, skip_logging=False
     
     # Extract model name (before the colon if present)
     model_display_name = model.split(':')[0] if ':' in model else model
+    
+    if skip_logging: #hack
+        model_display_name = "PenphinMind"
     
     # Extract user prompt from last message
     user_prompt = ""
@@ -1680,7 +1928,12 @@ def run_chat_completion(model, messages, system_message=None, skip_logging=False
                 flp.show()
             except:
                 pass
-        # Then show the timer
+        
+        # Wait for ollama tune to finish before starting timer with ticks
+        while tune_playing.is_set():
+            time.sleep(0.1)
+        
+        # Then show the timer with sound effects (now that tune is done)
         display_timer(start_time, stop_timer, sound_fx=True)
     
     display_thread = threading.Thread(target=display_handler)
@@ -1692,12 +1945,33 @@ def run_chat_completion(model, messages, system_message=None, skip_logging=False
             messages.insert(0, {"role": "system", "content": system_message})
 
         response = requests.post(
-            "http://localhost:11434/v1/chat/completions",
+            "http://localhost:11434/api/chat",
             headers={"Content-Type": "application/json"},
-            json={"model": model, "messages": messages}
+            json={
+                "model": model, 
+                "messages": messages,
+                "stream": False
+            }
         )
         response.raise_for_status()
-        result = response.json()["choices"][0]["message"]["content"]
+        
+        # Debug: Check what we actually got from Ollama
+        if not response.text.strip():
+            raise Exception(f"Ollama returned empty response for model {model}")
+        
+        try:
+            response_data = response.json()
+        except json.JSONDecodeError as e:
+            raise Exception(f"Invalid JSON response from Ollama for model {model}. Response: {response.text[:200]}...")
+        
+        # Check if response has expected structure
+        if "message" not in response_data:
+            raise Exception(f"Unexpected response structure from Ollama for model {model}. Got: {response_data}")
+        
+        if "content" not in response_data["message"]:
+            raise Exception(f"Missing content in Ollama response for model {model}. Message: {response_data['message']}")
+            
+        result = response_data["message"]["content"]
         
         # Stop timer and calculate elapsed time
         stop_timer.set()
@@ -1729,52 +2003,7 @@ def run_chat_completion(model, messages, system_message=None, skip_logging=False
         stop_system_processing()
         raise e
 
-def detect_usb_mic_device():
-    """
-    Detects the first USB capture device using arecord -l.
-    Returns a string like 'plughw:0,0' or 'default' if not found.
-    """
-    try:
-        result = subprocess.run(['arecord', '-l'], stdout=subprocess.PIPE, text=True)
-        for line in result.stdout.splitlines():
-            if 'USB Audio' in line or 'PnP Sound Device' in line:
-                match = re.search(r'card (\d+): .*?\[.*?\], device (\d+):', line)
-                if match:
-                    card = match.group(1)
-                    device = match.group(2)
-                    return f"plughw:{card},{device}"
-    except Exception as e:
-        print(f"Mic detection failed: {e}")
-    
-    return "default"
 
-def detect_usb_audio_device():
-    try:
-        result = subprocess.run(['aplay', '-l'], stdout=subprocess.PIPE, text=True)
-        for line in result.stdout.splitlines():
-            if 'USB Audio' in line:
-                match = re.search(r'card (\d+):', line)
-                if match:
-                    return f"plughw:{match.group(1)},0"
-    except Exception as e:
-        print(f"Audio detection failed: {e}")
-    return "default"
-
-AUDIO_DEVICE = detect_usb_audio_device()
-MIC_DEVICE = detect_usb_mic_device()  # Initialize microphone device
-VOICES_DIR = "/home/codemusic/piper/voices"
-DEFAULT_MODEL = "tinydolphin:1.1b"
-DEFAULT_VOICE = os.environ.get("PIPER_VOICE", "en_GB-jarvis")
-history = []
-MAX_HISTORY = 10  # Max number of exchanges to retain for context
-VOICES_DIR = "/home/codemusic/piper/voices"
-
-# Separate history for button-initiated conversations
-button_history = []
-MAX_BUTTON_HISTORY = 10  # Max number of button chat exchanges to retain
-
-# -------- VOICE INTRO SYSTEM -------- #
-INTROS_DIR = Path.home() / "roverseer_voice_intros"
 
 def ensure_intros_dir():
     """Create the intros directory if it doesn't exist"""
@@ -1939,47 +2168,13 @@ def home():
 
         # Check if PenphinMind is selected
         if model.lower() == "penphinmind":
-            # Use bicameral_chat endpoint
+            # Use bicameral_chat_direct function
             try:
-                # Call bicameral_chat endpoint
-                res = requests.post(
-                    "http://localhost:5000/bicameral_chat",
-                    json={
-                        "prompt": user_input,
-                        "system": system,
-                        "voice": voice,
-                        "speak": output_type == 'speak'
-                    }
-                )
-                
-                if res.ok:
-                    if output_type == 'speak':
-                        data = res.json()
-                        # Extract all responses
-                        logical_response = data.get("logical_response", "")
-                        logical_model = data.get("logical_model", logical_model)
-                        creative_response = data.get("creative_response", "")
-                        creative_model = data.get("creative_model", creative_model)
-                        reply_text = data.get("final_synthesis", "")
-                        convergence_model = data.get("convergence_model", convergence_model)
-                        
-                        # Store all responses in history
-                        history.append((user_input, logical_response, logical_model))
-                        history.append((user_input, creative_response, creative_model))
-                        history.append((user_input, reply_text, convergence_model))
-                    else:
-                        # Handle audio file response
-                        tmp_audio = f"{uuid.uuid4().hex}.wav"
-                        with open(f"/tmp/{tmp_audio}", 'wb') as f:
-                            f.write(res.content)
-                        audio_url = url_for('serve_static', filename=tmp_audio)
-                        reply_text = "(Bicameral synthesis audio returned)"
-                        history.append((user_input, reply_text, "PenphinMind"))
-                else:
-                    reply_text = f"Error: {res.text}"
-                    
+                reply_text = bicameral_chat_direct(user_input, system)
+                # Add to history
+                history.append((user_input, reply_text, "PenphinMind"))
             except Exception as e:
-                reply_text = f"Bicameral request failed: {e}"
+                reply_text = f"Bicameral processing error: {e}"
         else:
             # Normal flow
             # Build message history context
@@ -1989,31 +2184,61 @@ def home():
                 messages.append({"role": "assistant", "content": ai_reply})
             messages.append({"role": "user", "content": user_input})
 
-            payload = {
-                "model": model,
-                "system": system,
-                "messages": messages,
-                "voice": voice,
-                "output_type": output_type
-            }
-
             try:
-                res = requests.post("http://localhost:5000/chat", json=payload)
-                if res.ok:
-                    if output_type == 'text':
-                        data = res.json()
-                        reply_text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    elif output_type == 'audio_file':
-                        tmp_audio = f"{uuid.uuid4().hex}.wav"
-                        with open(f"/tmp/{tmp_audio}", 'wb') as f:
-                            f.write(res.content)
+                if output_type == 'text':
+                    # Direct function call for text response
+                    reply = run_chat_completion(model, messages, system)
+                    reply_text = reply
+                    
+                elif output_type == 'audio_file':
+                    # Direct function call + TTS for audio file
+                    reply = run_chat_completion(model, messages, system)
+                    
+                    # Generate TTS
+                    model_path, config_path = find_voice_files(voice)
+                    tmp_audio = f"{uuid.uuid4().hex}.wav"
+                    
+                    tts_result = subprocess.run(
+                        ["/home/codemusic/roverseer_venv/bin/piper",
+                         "--model", model_path,
+                         "--config", config_path,
+                         "--output_file", f"/tmp/{tmp_audio}"],
+                        input=reply.encode(),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE
+                    )
+                    
+                    if tts_result.returncode == 0:
                         audio_url = url_for('serve_static', filename=tmp_audio)
                         reply_text = "(Audio response returned)"
-                    else:  # speak
-                        data = res.json()
-                        reply_text = data.get("spoken_text", "")
-                else:
-                    reply_text = f"Error: {res.text}"
+                    else:
+                        reply_text = f"TTS failed: {tts_result.stderr.decode()}"
+                        
+                else:  # speak
+                    # Direct function call + TTS + speak
+                    reply = run_chat_completion(model, messages, system)
+                    
+                    # Generate and play TTS
+                    model_path, config_path = find_voice_files(voice)
+                    tmp_wav = f"/tmp/{uuid.uuid4().hex}.wav"
+                    
+                    tts_result = subprocess.run(
+                        ["/home/codemusic/roverseer_venv/bin/piper",
+                         "--model", model_path,
+                         "--config", config_path,
+                         "--output_file", tmp_wav],
+                        input=reply.encode(),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE
+                    )
+                    
+                    if tts_result.returncode == 0:
+                        # Play audio
+                        subprocess.run(["aplay", "-D", AUDIO_DEVICE, tmp_wav])
+                        os.remove(tmp_wav)
+                        reply_text = reply
+                    else:
+                        reply_text = f"TTS failed: {tts_result.stderr.decode()}"
 
                 history.append((user_input, reply_text, model))
             except Exception as e:
@@ -2709,7 +2934,7 @@ def transcribe_chat_voice():
 @app.route('/bicameral_chat', methods=['POST'])
 def bicameral_chat():
     """
-    Three-agent bicameral mind system that converges perspectives.
+    Two-agent bicameral mind system that converges perspectives, with random convergence role assignment.
     ---
     consumes:
       - application/json
@@ -2723,7 +2948,7 @@ def bicameral_chat():
             prompt:
               type: string
               example: What is the nature of consciousness?
-              description: The input prompt to process through three minds
+              description: The input prompt to process through two minds
             system:
               type: string
               example: You are an expert philosopher.
@@ -2743,7 +2968,7 @@ def bicameral_chat():
       200:
         description: Either JSON with spoken status or WAV audio file
     """
-    global current_audio_process
+    global current_audio_process, convergence_model
     data = request.get_json(silent=True)
     if not data or "prompt" not in data:
         return jsonify({"status": "error", "message": "Missing prompt"}), 400
@@ -2756,8 +2981,6 @@ def bicameral_chat():
     if not prompt:
         return jsonify({"status": "error", "message": "No prompt provided"}), 400
 
-
-
     try:
         # Play the unique bicameral connection tune
         play_sound_async(play_bicameral_connection_tune)
@@ -2768,131 +2991,159 @@ def bicameral_chat():
         # System message for the bicameral process
         bicameral_system_message = f"Bicameral processing for: {prompt[:50]}..."
         
-        # 1. Send to Logical Mind
-        logical_start_time = time.time()
-        logical_messages = [{"role": "user", "content": prompt}]
-        logical_system = logical_message
+        # Randomly decide which model will handle convergence
+        convergence_model = random.choice([logical_model, creative_model])
+        first_model = logical_model if convergence_model == creative_model else creative_model
         
-        logical_response = run_chat_completion(logical_model, logical_messages, logical_system, skip_logging=True)
-        logical_time = time.time() - logical_start_time
-        
-        # Keep LLM LED state, don't stop
-        time.sleep(0.5)  # Brief pause between minds
-        
-        # 2. Send to Creative Mind
-        creative_start_time = time.time()
-        creative_messages = [{"role": "user", "content": prompt}]
-        creative_system = creative_message
-        
-        creative_response = run_chat_completion(creative_model, creative_messages, creative_system, skip_logging=True)
-        creative_time = time.time() - creative_start_time
-        
-        # Keep LLM LED state, don't stop
-        time.sleep(0.5)  # Brief pause between minds
-        
-        # 3. Send all to Convergence Mind
-        convergence_start_time = time.time()
-        
-        # Build convergence prompt base
-        convergence_prompt_base = f"""You are a unified intelligence — a balanced mind that merges diverse perspectives into coherent, actionable insight. 
+        try:
+            # 1. Send to First Mind
+            first_start_time = time.time()
+            first_messages = [{"role": "user", "content": prompt}]
+            first_system = logical_message if first_model == logical_model else creative_message
+            
+            first_response = run_chat_completion(first_model, first_messages, first_system, skip_logging=True)
+            first_time = time.time() - first_start_time
+            
+            # Keep LLM LED state, don't stop
+            time.sleep(0.5)  # Brief pause between minds
+            
+            # 2. Send to Second Mind (which will also handle convergence)
+            second_start_time = time.time()
+            second_messages = [{"role": "user", "content": prompt}]
+            second_system = logical_message if convergence_model == logical_model else creative_message
+            
+            second_response = run_chat_completion(convergence_model, second_messages, second_system, skip_logging=True)
+            second_time = time.time() - second_start_time
+            
+            # Keep LLM LED state, don't stop
+            time.sleep(0.5)  # Brief pause before convergence
+            
+            # 3. Send all to Convergence Mind (using the same model as second mind)
+            convergence_start_time = time.time()
+            
+            # Build convergence prompt base
+            convergence_prompt_base = f"""
+                        [IMPORTANT: You are a unified intelligence — a balanced mind that merges diverse perspectives into a single, coherent, and actionable insight.
 
-                Given multiple viewpoints, your task is to form a single response that directly addresses the original prompt with clarity, depth, and nuance.
+                        Draw equally from all provided inputs, honoring each viewpoint without bias or preference. Your goal is not to summarize or compare, but to integrate — forming a new whole that speaks with clarity, depth, and nuance.
 
-                Speak as one voice. 
-                Do not reference or describe the perspectives you were given. 
-                Do not reflect on your own process. 
-                Simply provide the final, synthesized insight.
+                        Respond as a single voice. 
+                        Do not mention or describe the original perspectives. 
+                        Do not reflect on your own reasoning process. 
+                        Simply provide the final, synthesized insight as your complete response.]
 
-                [Original request:
-                {prompt}
+                    [Original request:
+                    {prompt}
 
-                Input 1:
-                {logical_response}
+                    Input 1:
+                    {first_response}
 
-                Input 2:
-                {creative_response}]"""
-        
-        # If system message provided, prepend it
-        if system:
-            convergence_prompt = system + ". " + convergence_prompt_base
-        else:
-            convergence_prompt = convergence_prompt_base
-        
-        convergence_messages = [{"role": "user", "content": convergence_prompt}]
+                    Input 2:
+                    {second_response}]"""
+            
+            # If system message provided, prepend it
+            if system:
+                convergence_prompt = system + ". " + convergence_prompt_base
+            else:
+                convergence_prompt = convergence_prompt_base
+            
+            convergence_messages = [{"role": "user", "content": convergence_prompt}]
 
-        final_response = run_chat_completion(convergence_model, convergence_messages, convergence_message, skip_logging=True)
-        convergence_time = time.time() - convergence_start_time
-        
-        # Log PenphinMind usage
-        log_penphin_mind_usage(
-            logical_model, creative_model, convergence_model,
-            bicameral_system_message, prompt,
-            logical_response, logical_time,
-            creative_response, creative_time,
-            final_response, convergence_time
-        )
-        
-        # Generate TTS for final response
-        model_path, config_path = find_voice_files(voice)
-        tmp_wav = f"/tmp/{uuid.uuid4().hex}.wav"
-        
-        # Transition to TTS stage
-        start_system_processing('C')
-        play_sound_async(play_tts_tune, voice)  # Play TTS tune asynchronously
-        
-        tts_start_time = time.time()
-        tts_result = subprocess.run(
-            ["/home/codemusic/roverseer_venv/bin/piper",
-             "--model", model_path,
-             "--config", config_path,
-             "--output_file", tmp_wav],
-            input=final_response.encode(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-        tts_processing_time = time.time() - tts_start_time
+            final_response = run_chat_completion(convergence_model, convergence_messages, convergence_message, skip_logging=True)
+            convergence_time = time.time() - convergence_start_time
+            
+            # Log PenphinMind usage
+            log_penphin_mind_usage(
+                first_model, convergence_model, convergence_model,
+                bicameral_system_message, prompt,
+                first_response, first_time,
+                second_response, second_time,
+                final_response, convergence_time
+            )
+            
+            # Generate TTS for final response
+            model_path, config_path = find_voice_files(voice)
+            tmp_wav = f"/tmp/{uuid.uuid4().hex}.wav"
+            
+            # Transition to TTS stage
+            start_system_processing('C')
+            play_sound_async(play_tts_tune, voice)  # Play TTS tune asynchronously
+            
+            tts_start_time = time.time()
+            tts_result = subprocess.run(
+                ["/home/codemusic/roverseer_venv/bin/piper",
+                 "--model", model_path,
+                 "--config", config_path,
+                 "--output_file", tmp_wav],
+                input=final_response.encode(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            tts_processing_time = time.time() - tts_start_time
 
-        if tts_result.returncode != 0:
+            if tts_result.returncode != 0:
+                stop_system_processing()
+                return jsonify({
+                    "status": "error",
+                    "message": f"Text-to-speech conversion failed: {tts_result.stderr.decode()}"
+                }), 500
+
+            # Log TTS usage
+            log_tts_usage(voice, final_response, tmp_wav, tts_processing_time)
+            
+            if speak:
+                # Play voice intro before speaking
+                play_sound_async(play_voice_intro, voice)
+                
+                # Transition to audio playback
+                start_system_processing('aplay')
+                
+                # Speak on rover
+                subprocess.run(["aplay", "-D", AUDIO_DEVICE, tmp_wav])
+                os.remove(tmp_wav)
+                
+                # Stop all LEDs
+                stop_system_processing()
+                
+                return jsonify({
+                    "status": "success",
+                    "original_prompt": prompt,
+                    "first_response": first_response,
+                    "second_response": second_response,
+                    "final_synthesis": final_response,
+                    "voice_used": voice,
+                    "spoken": True
+                })
+            else:
+                # Return audio file
+                stop_system_processing()
+                return send_file(tmp_wav, mimetype="audio/wav", as_attachment=True, download_name="bicameral_synthesis.wav")
+                
+        except Exception as e:
             stop_system_processing()
-            return jsonify({
-                "status": "error",
-                "message": f"Piper TTS failed: {tts_result.stderr.decode()}"
-            }), 500
-
-        # Log TTS usage
-        log_tts_usage(voice, final_response, tmp_wav, tts_processing_time)
-        
-        if speak:
-            # Play voice intro before speaking
-            play_sound_async(play_voice_intro, voice)
-            
-            # Transition to audio playback
-            start_system_processing('aplay')
-            
-            # Speak on rover
-            subprocess.run(["aplay", "-D", AUDIO_DEVICE, tmp_wav])
-            os.remove(tmp_wav)
-            
-            # Stop all LEDs
-            stop_system_processing()
-            
-            return jsonify({
-                "status": "success",
-                "original_prompt": prompt,
-                "logical_response": logical_response,
-                "creative_response": creative_response,
-                "final_synthesis": final_response,
-                "voice_used": voice,
-                "spoken": True
-            })
-        else:
-            # Return audio file
-            stop_system_processing()
-            return send_file(tmp_wav, mimetype="audio/wav", as_attachment=True, download_name="bicameral_synthesis.wav")
+            error_msg = str(e)
+            if "Connection refused" in error_msg:
+                return jsonify({
+                    "status": "error",
+                    "message": "Failed to connect to Ollama service. Please ensure Ollama is running."
+                }), 500
+            elif "model not found" in error_msg.lower():
+                return jsonify({
+                    "status": "error",
+                    "message": f"Model not found: {error_msg}"
+                }), 500
+            else:
+                return jsonify({
+                    "status": "error",
+                    "message": f"Bicameral processing failed: {error_msg}"
+                }), 500
 
     except Exception as e:
         stop_system_processing()
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return jsonify({
+            "status": "error",
+            "message": f"System error: {str(e)}"
+        }), 500
 
 @app.route('/logs')
 def logs():
@@ -3105,6 +3356,154 @@ def transcribe_and_chat():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
+@app.route('/v1/chat/completions', methods=['POST'])
+def openai_compatible_chat():
+    """
+    OpenAI-compatible chat completions endpoint that aliases to our chat system.
+    ---
+    consumes:
+      - application/json
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          properties:
+            model:
+              type: string
+              example: tinydolphin:1.1b
+              description: The model to use for completion
+            messages:
+              type: array
+              items:
+                type: object
+                properties:
+                  role:
+                    type: string
+                    enum: ['system', 'user', 'assistant']
+                  content:
+                    type: string
+              description: Array of messages in the conversation
+            temperature:
+              type: number
+              default: 0.7
+              description: Sampling temperature (ignored in current implementation)
+            max_tokens:
+              type: integer
+              description: Maximum tokens to generate (ignored in current implementation)
+          required:
+            - model
+            - messages
+    responses:
+      200:
+        description: OpenAI-compatible chat completion response
+        schema:
+          type: object
+          properties:
+            id:
+              type: string
+              example: chatcmpl-abc123
+            object:
+              type: string
+              example: chat.completion
+            created:
+              type: integer
+              example: 1677652288
+            model:
+              type: string
+              example: tinydolphin:1.1b
+            choices:
+              type: array
+              items:
+                type: object
+                properties:
+                  index:
+                    type: integer
+                  message:
+                    type: object
+                    properties:
+                      role:
+                        type: string
+                        example: assistant
+                      content:
+                        type: string
+                        example: I'm a helpful AI assistant.
+                  finish_reason:
+                    type: string
+                    example: stop
+            usage:
+              type: object
+              properties:
+                prompt_tokens:
+                  type: integer
+                completion_tokens:
+                  type: integer
+                total_tokens:
+                  type: integer
+    """
+    data = request.get_json(silent=True)
+    if not data or "messages" not in data:
+        return jsonify({"error": {"message": "Missing messages", "type": "invalid_request_error"}}), 400
+
+    model = data.get("model", DEFAULT_MODEL)
+    messages = data.get("messages", [])
+    
+    # Extract system message if present
+    system_message = None
+    filtered_messages = []
+    
+    for msg in messages:
+        if msg.get("role") == "system":
+            system_message = msg.get("content", "")
+        else:
+            filtered_messages.append(msg)
+    
+    # Use default system message if none provided
+    if not system_message:
+        system_message = "You are RoverSeer, a helpful assistant."
+
+    try:
+        # Start LLM processing LED if this is from the recording pipeline
+        if not any(stage for stage in pipeline_stages.values() if stage):
+            start_system_processing('B')
+        
+        reply = run_chat_completion(model, filtered_messages, system_message)
+        
+        # Stop LED processing if we started it
+        if pipeline_stages.get('llm_active'):
+            stop_system_processing()
+        
+        # Return OpenAI-compatible response format
+        return jsonify({
+            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": reply},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": len(json.dumps(filtered_messages).split()),
+                "completion_tokens": len(reply.split()),
+                "total_tokens": len(json.dumps(filtered_messages).split()) + len(reply.split())
+            }
+        })
+        
+    except Exception as e:
+        # Stop LED processing on error
+        if pipeline_stages.get('llm_active'):
+            stop_system_processing()
+        
+        return jsonify({
+            "error": {
+                "message": str(e),
+                "type": "internal_server_error"
+            }
+        }), 500
     
 # Initialize Rainbow Driver before running the app
 rainbow = None
